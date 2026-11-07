@@ -1,0 +1,479 @@
+package funkin.backend.system;
+
+import flixel.addons.transition.FlxTransitionSprite.GraphicTransTileDiamond;
+import flixel.addons.transition.FlxTransitionableState;
+import flixel.addons.transition.TransitionData;
+import flixel.graphics.FlxGraphic;
+import flixel.math.FlxPoint;
+import flixel.math.FlxRect;
+import funkin.backend.system.FakeCamera;
+import funkin.backend.system.FakeCamera.FakeCallCamera;
+import flixel.system.ui.FlxSoundTray;
+import funkin.backend.assets.AssetSource;
+import funkin.backend.assets.AssetsLibraryList;
+import funkin.backend.assets.ModsFolder;
+import funkin.backend.system.console.ConsoleUI;
+import funkin.backend.system.framerate.Framerate;
+import funkin.backend.system.framerate.SystemInfo;
+import funkin.backend.system.modules.*;
+import funkin.backend.utils.ThreadUtil;
+import funkin.editors.SaveWarning;
+import funkin.options.PlayerSettings;
+import openfl.Assets;
+import openfl.Lib;
+import openfl.display.Sprite;
+import openfl.text.TextFormat;
+import openfl.utils.AssetLibrary;
+import sys.FileSystem;
+import sys.io.File;
+
+#if IMGUI_ENABLED
+import lime.tools.imgui.ImGuiFlags;
+import lime.tools.imgui.ImGuiTypes;
+#end
+
+class Main extends Sprite
+{
+	public static var instance:Main;
+
+	public static var modToLoad:String = null;
+	public static var forceGPUOnlyBitmapsOff:Bool = false;
+	public static var noTerminalColor:Bool = false;
+	public static var verbose:Bool = false;
+	public static var goToSong:String = null;
+	public static var goToDifficulty:String = null;
+	public static var goToVariation:String = null;
+	public static var goToCharter:Bool = false;
+
+	public static var scaleMode:FunkinRatioScaleMode;
+	#if !web
+	public static var framerateSprite:Framerate;
+	#end
+
+	var gameWidth:Int = 1280; // Width of the game in pixels (might be less / more in actual pixels).
+	var gameHeight:Int = 720; // Height of the game in pixels (might be less / more in actual pixels).
+	var skipSplash:Bool = true; // Whether to skip the flixel splash screen that appears in release mode.
+	var startFullscreen:Bool = false; // Whether to start the game in fullscreen on desktop targets
+
+	public static var game:FunkinGame;
+
+	/**
+	 * The time since the game was focused last time in seconds.
+	 */
+	public static var timeSinceFocus(get, never):Float;
+	public static var time:Int = 0;
+
+	// You can pretty much ignore everything from here on - your code should go in your states.
+
+	public static function preInit() {
+		#if sys
+		funkin.backend.utils.NativeAPI.registerAsDPICompatible();
+		funkin.backend.system.CommandLineHandler.parseCommandLine(Sys.args());
+		funkin.backend.system.Main.fixWorkingDirectory();
+		funkin.backend.system.Logs.init();
+		#end
+	}
+
+	public function new()
+	{
+		super();
+
+		instance = this;
+
+		#if IMGUI_ENABLED
+		initImGui();
+		addChild(ImGuiHandler.instance);
+		#end
+		// Before the game loop, so an uncaught error is drawn in-game instead of closing the window.
+		CrashHandler.init();
+		ConsoleUI.init();
+
+		// i hate you hxcpp
+		FakeCamera.instance = new FakeCamera();
+		FakeCallCamera.instance = new FakeCallCamera();
+
+		addChild(game = new FunkinGame(gameWidth, gameHeight, #if mobile funkin.mobile.CopyState.getStartState() #else MainState #end, Options.framerate, Options.framerate, skipSplash, startFullscreen));
+
+		#if !web
+		addChild(framerateSprite = new Framerate());
+		SystemInfo.init();
+		#end
+
+		#if mobile
+		initMobile();
+		#end
+	}
+
+	@:dox(hide)
+	public static var audioDisconnected:Bool = false;
+
+	public static var changeID:Int = 0;
+	public static var pathBack = #if (windows || linux)
+			"../../../../"
+		#elseif mac
+			"../../../../../../../"
+		#else
+			"../../../../"
+		#end;
+	public static var startedFromSource:Bool = #if TEST_BUILD true #else false #end;
+
+	// DEPRECATED
+	@:dox(hide) public static function execAsync(func:Void->Void) ThreadUtil.execAsync(func);
+
+	public static function loadGameSettings() {
+		WindowUtils.init();
+		SaveWarning.init();
+		MemoryUtil.init();
+		FunkinCache.init();
+		Paths.assetsTree = new AssetsLibraryList();
+
+		#if UPDATE_CHECKING
+		funkin.backend.system.updating.UpdateUtil.init();
+		#end
+		Paths.init();
+
+		hscript.Interp.importRedirects = funkin.backend.scripting.Script.getDefaultImportRedirects();
+
+		#if GLOBAL_SCRIPT
+		funkin.backend.scripting.GlobalScript.init();
+		#end
+
+		var lib = new AssetLibrary();
+		@:privateAccess
+		lib.__proxy = Paths.assetsTree;
+		Assets.registerLibrary('default', lib);
+
+		funkin.options.PlayerSettings.init();
+		Options.load();
+		funkin.backend.system.modules.AntiCrash.init();
+		funkin.backend.utils.ScreenUtil.init();
+
+		game.focusLostFramerate = 30;
+		FlxG.fixedTimestep = false;
+		FlxG.scaleMode = scaleMode = new FunkinRatioScaleMode();
+		FlxG.sound.applySoundCurve = applySoundCurve;
+		FlxG.sound.reverseSoundCurve = reverseSoundCurve;
+
+		Conductor.init();
+		EventManager.init();
+		funkin.mobile.TouchUtil.init();
+		FlxG.signals.focusGained.add(onFocus);
+		FlxG.signals.preStateSwitch.add(onStateSwitch);
+		FlxG.signals.postStateSwitch.add(onStateSwitchPost);
+		FlxG.signals.postUpdate.add(onUpdate);
+
+		FlxG.mouse.useSystemCursor = true;
+		#if DARK_MODE_WINDOW
+		if(funkin.backend.utils.NativeAPI.hasVersion("Windows 10")) funkin.backend.utils.NativeAPI.redrawWindowHeader();
+		#end
+
+		ModsFolder.init();
+		#if MOD_SUPPORT
+		if (FileSystem.exists("mods/autoload.txt"))
+			modToLoad = File.getContent("mods/autoload.txt").trim();
+
+		ModsFolder.switchMod(modToLoad.getDefault(Options.lastLoadedMod));
+		#end
+
+		initTransition();
+	}
+
+	#if mobile
+	function initMobile() {
+		FlxG.signals.preStateCreate.add((state) -> {
+			if (state != null) Logs.trace('Creating state: ' + Type.getClassName(Type.getClass(state)), VERBOSE);
+		});
+		applyImmersive();
+		updateMobileFramerateScale();
+		Lib.current.stage.addEventListener(openfl.events.Event.RESIZE, (_) -> updateMobileFramerateScale());
+		Lib.current.stage.addEventListener(openfl.events.MouseEvent.MOUSE_DOWN, (_) -> recoverFocus());
+		Lib.current.stage.addEventListener(openfl.events.Event.ACTIVATE, (_) -> {
+			recoverFocus();
+			scheduleScreenRefresh();
+		});
+		FlxG.signals.focusGained.add(scheduleScreenRefresh);
+		FlxG.signals.postUpdate.add(checkScreenSize);
+		framerateSprite.addEventListener(openfl.events.MouseEvent.CLICK, (_) -> {
+			if (Options.fpsCounter)
+				Framerate.debugMode = Framerate.debugMode == 1 ? 2 : 1;
+		});
+	}
+
+	public static var safeInsetLeft:Float = 0;
+	public static var safeInsetTop:Float = 0;
+	public static var safeInsetRight:Float = 0;
+	public static var safeInsetBottom:Float = 0;
+	public static var framerateBaseScale:Float = 1;
+
+	static function updateSafeInsets() {
+		#if android
+		try {
+			var method:Dynamic = lime.system.JNI.createStaticMethod("org/codename/mobile/ScreenHelper", "getSafeInsets", "()Ljava/lang/String;");
+			if (method == null) return;
+			var parts = Std.string(method()).split(",");
+			if (parts.length == 4) {
+				safeInsetLeft = Math.max(0, Std.parseFloat(parts[0]));
+				safeInsetTop = Math.max(0, Std.parseFloat(parts[1]));
+				safeInsetRight = Math.max(0, Std.parseFloat(parts[2]));
+				safeInsetBottom = Math.max(0, Std.parseFloat(parts[3]));
+			}
+		} catch (_:Dynamic) {}
+		#end
+	}
+
+	static function updateMobileFramerateScale() {
+		if (framerateSprite == null || Lib.current.stage == null) return;
+		updateSafeInsets();
+		Framerate.offset.x = 0;
+		var gameScale:Float = FlxG.scaleMode != null ? FlxG.scaleMode.scale.y : Lib.current.stage.stageHeight / 720;
+		if (gameScale <= 0 || Math.isNaN(gameScale)) gameScale = 1;
+		framerateBaseScale = FlxMath.bound(gameScale * 0.8, 0.6, 2.4);
+		framerateSprite.scaleX = framerateSprite.scaleY = framerateBaseScale;
+	}
+
+	static function applyImmersive() {
+		#if android
+		try {
+			var method:Dynamic = lime.system.JNI.createStaticMethod("org/codename/mobile/ScreenHelper", "applyImmersive", "()V");
+			if (method != null) method();
+		} catch (_:Dynamic) {}
+		#end
+	}
+
+	static function scheduleScreenRefresh() {
+		applyImmersive();
+		refreshScreen();
+		for (delay in [100, 300, 800, 1500])
+			haxe.Timer.delay(refreshScreen, delay);
+	}
+
+	static function syncNativeWindowSize():Bool @:privateAccess {
+		#if lime_cffi
+		var window = lime.app.Application.current != null ? lime.app.Application.current.window : null;
+		if (window == null || window.__backend == null || window.__backend.handle == null) return false;
+		try {
+			var handle = window.__backend.handle;
+			var width:Int = lime._internal.backend.native.NativeCFFI.lime_window_get_width(handle);
+			var height:Int = lime._internal.backend.native.NativeCFFI.lime_window_get_height(handle);
+			var scale:Float = lime._internal.backend.native.NativeCFFI.lime_window_get_scale(handle);
+			if (width <= 0 || height <= 0) return false;
+			var changed = width != window.__width || height != window.__height || (scale > 0 && scale != window.__scale);
+			if (!changed) return false;
+			Logs.trace('[Screen] Window size was ${window.__width}x${window.__height}@${window.__scale}, actual ${width}x${height}@${scale}', WARNING);
+			window.__width = width;
+			window.__height = height;
+			if (scale > 0) window.__scale = scale;
+			window.onResize.dispatch(width, height);
+			return true;
+		} catch (_:Dynamic) {}
+		#end
+		return false;
+	}
+
+	static var screenCheckTimer:Float = 0;
+
+	static function refreshScreen() @:privateAccess {
+		var stage = Lib.current.stage;
+		if (stage == null || stage.window == null) return;
+		try {
+			syncNativeWindowSize();
+			stage.__resize();
+			if (FlxG.game != null) FlxG.game.onResize(null);
+			updateMobileFramerateScale();
+		} catch (_:Dynamic) {}
+	}
+
+	static function checkScreenSize() {
+		var stage = Lib.current.stage;
+		if (stage == null || FlxG.scaleMode == null) return;
+		screenCheckTimer += FlxG.elapsed;
+		if (screenCheckTimer >= 0.5) {
+			screenCheckTimer = 0;
+			if (syncNativeWindowSize()) {
+				refreshScreen();
+				return;
+			}
+		}
+		@:privateAccess
+		var device = FlxG.scaleMode.deviceSize;
+		if (device == null) return;
+		if (Std.int(device.x) != stage.stageWidth || Std.int(device.y) != stage.stageHeight)
+			refreshScreen();
+	}
+
+	static function recoverFocus() @:privateAccess {
+		if (FlxG.game != null && FlxG.game._lostFocus)
+			FlxG.game.onFocus(null);
+	}
+	#end
+
+	public static function applySoundCurve(volume:Float) {
+		return Flags.USE_SOUND_VOLUME_CURVE ? Math.pow(volume, 1.75) : volume;
+	}
+
+	public static function reverseSoundCurve(curvedVolume:Float) {
+		return Flags.USE_SOUND_VOLUME_CURVE ? Math.pow(curvedVolume, 0.5714285714285714) : curvedVolume;
+	}
+
+	static var persistShaderKeys:Map<String, Bool>;
+
+	public static function refreshShaders() @:privateAccess {
+		if (persistShaderKeys == null) {
+			persistShaderKeys = [for (k in Lib.current.stage.context3D.__programs.keys()) k => true];
+		}
+		else {
+			for (key => program in Lib.current.stage.context3D.__programs) {
+				if (persistShaderKeys.get(key) || Type.resolveClass(key) != null) continue;
+
+				program.dispose();
+				Lib.current.stage.context3D.__programs.remove(key);
+			}
+		}
+	}
+
+	public static function refreshAssets() @:privateAccess {
+		FunkinCache.instance.clearSecondLayer();
+
+		var game = FlxG.game;
+		var daSndTray = Type.createInstance(game._customSoundTray = funkin.menus.ui.FunkinSoundTray, []);
+		var index:Int = game.numChildren - 1;
+
+		if(game.soundTray != null)
+		{
+			var newIndex:Int = game.getChildIndex(game.soundTray);
+			if(newIndex != -1) index = newIndex;
+			game.removeChild(game.soundTray);
+			game.soundTray.__cleanup();
+		}
+
+		game.addChildAt(game.soundTray = daSndTray, index);
+
+		refreshShaders();
+	}
+
+	public static function initTransition() {
+		var diamond:FlxGraphic = FlxGraphic.fromClass(GraphicTransTileDiamond);
+		diamond.persist = true;
+		diamond.destroyOnNoUse = false;
+
+		FlxTransitionableState.defaultTransIn = new TransitionData(FADE, 0xFF000000, 1, new FlxPoint(0, -1), {asset: diamond, width: 32, height: 32},
+			new FlxRect(-200, -200, FlxG.width * 1.4, FlxG.height * 1.4));
+		FlxTransitionableState.defaultTransOut = new TransitionData(FADE, 0xFF000000, 0.7, new FlxPoint(0, 1),
+			{asset: diamond, width: 32, height: 32}, new FlxRect(-200, -200, FlxG.width * 1.4, FlxG.height * 1.4));
+	}
+
+	public static function onFocus() {
+		_tickFocused = FlxG.game.ticks;
+	}
+
+	private static function onStateSwitch() {
+		scaleMode.resetSize();
+	}
+	public static function onUpdate() {
+		if (#if IMGUI_ENABLED Options.useNativeConsole && #end
+			PlayerSettings.solo.controls.DEV_CONSOLE)
+			NativeAPI.allocConsole();
+
+		#if IMGUI_ENABLED
+		if ((ImGuiIO.configFlags & ImGuiConfigFlags.ViewportsEnable) != 0)
+		{
+			if (ImGui.isAnyWindowMultiViewport()) {
+				if (!imGuiActiveLastFrame) {
+					imGuiActiveLastFrame = true;
+					FlxG.autoPause = false;
+					FlxG.game.focusLostFramerate = FlxG.drawFramerate;
+				}
+			} else {
+				if (imGuiActiveLastFrame) {
+					imGuiActiveLastFrame = false;
+					FlxG.autoPause = Options.autoPause;
+					FlxG.game.focusLostFramerate = 30;
+				}
+			}
+		}
+		#end
+
+		if (PlayerSettings.solo.controls.FPS_COUNTER && Options.fpsCounter)
+			Framerate.debugMode = (Framerate.debugMode + 1) % 3;
+	}
+
+	private static function onStateSwitchPost() {
+		// manual asset clearing since base openfl one does'nt clear lime one
+		// does'nt clear bitmaps since flixel fork does it auto
+
+		MemoryUtil.clearMajor();
+	}
+
+	public static var noCwdFix:Bool = false;
+	public static function fixWorkingDirectory() {
+		#if windows
+		if (!noCwdFix && !sys.FileSystem.exists('manifest/default.json')) {
+			Sys.setCwd(haxe.io.Path.directory(Sys.programPath()));
+		}
+		#elseif (mobile || switch)
+		StorageUtil.init();
+		#end
+	}
+
+	private static var _tickFocused:Float = 0;
+	public static function get_timeSinceFocus():Float {
+		return (FlxG.game.ticks - _tickFocused) / 1000;
+	}
+
+	#if IMGUI_ENABLED
+	private static var imGuiActiveLastFrame:Bool = true;
+	#end
+	private static function initImGui() {
+		#if IMGUI_ENABLED
+		//codename styled
+		var vcrFont = ImGuiIO.fonts.addFontFromFileTTF("assets/fonts/vcr.ttf");
+		ImGuiIO.fontDefault = vcrFont;
+		var style = ImGui.getStyle();
+		style.windowBorderSize = 2;
+		style.childBorderSize = 2;
+		style.popupBorderSize = 2;
+		style.frameBorderSize = 2;
+		style.windowRounding = 6;
+		style.childRounding = 6;
+		style.popupRounding = 6;
+		style.frameRounding = 6;
+		style.scrollbarRounding = 6;
+		style.grabRounding = 6;
+		style.setColor(ImGuiCol.WindowBg,               new ImVec4(0.11, 0.00, 0.16, 0.8));
+		style.setColor(ImGuiCol.Border,                 new ImVec4(0.59, 0.59, 0.59, 0.50));
+		style.setColor(ImGuiCol.FrameBg,                new ImVec4(0.13, 0.00, 0.19, 0.54));
+		style.setColor(ImGuiCol.FrameBgHovered,         new ImVec4(0.33, 0.15, 0.42, 0.40));
+		style.setColor(ImGuiCol.FrameBgActive,          new ImVec4(0.33, 0.15, 0.42, 0.67));
+		style.setColor(ImGuiCol.TitleBg,                new ImVec4(0.38, 0.36, 0.40, 0.32));
+		style.setColor(ImGuiCol.TitleBgActive,          new ImVec4(0.38, 0.36, 0.40, 0.72));
+		style.setColor(ImGuiCol.CheckMark,              new ImVec4(0.80, 0.60, 1.00, 1.00));
+		style.setColor(ImGuiCol.SliderGrab,             new ImVec4(0.33, 0.30, 0.35, 1.00));
+		style.setColor(ImGuiCol.SliderGrabActive,       new ImVec4(0.80, 0.60, 1.00, 1.00));
+		style.setColor(ImGuiCol.Button,                 new ImVec4(0.14, 0.13, 0.13, 0.99));
+		style.setColor(ImGuiCol.ButtonHovered,          new ImVec4(0.39, 0.00, 0.59, 1.00));
+		style.setColor(ImGuiCol.ButtonActive,           new ImVec4(0.76, 0.00, 1.00, 1.00));
+		style.setColor(ImGuiCol.Header,                 new ImVec4(0.15, 0.13, 0.13, 0.8));
+		style.setColor(ImGuiCol.HeaderHovered,          new ImVec4(0.39, 0.00, 0.59, 0.80));
+		style.setColor(ImGuiCol.HeaderActive,           new ImVec4(0.76, 0.00, 1.00, 1.00));
+		style.setColor(ImGuiCol.SeparatorHovered,       new ImVec4(0.39, 0.00, 0.59, 0.78));
+		style.setColor(ImGuiCol.SeparatorActive,        new ImVec4(0.76, 0.00, 1.00, 1.00));
+		style.setColor(ImGuiCol.ResizeGrip,             new ImVec4(0.15, 0.13, 0.13, 0.20));
+		style.setColor(ImGuiCol.ResizeGripHovered,      new ImVec4(0.39, 0.00, 0.59, 0.67));
+		style.setColor(ImGuiCol.ResizeGripActive,       new ImVec4(0.76, 0.00, 1.00, 0.95));
+		style.setColor(ImGuiCol.InputTextCursor,        new ImVec4(0.68, 0.13, 0.96, 1.00));
+		style.setColor(ImGuiCol.TabHovered,             new ImVec4(0.39, 0.00, 0.59, 0.80));
+		style.setColor(ImGuiCol.Tab,                    new ImVec4(0.21, 0.19, 0.19, 0.86));
+		style.setColor(ImGuiCol.TabSelected,            new ImVec4(0.76, 0.00, 1.00, 1.00));
+		style.setColor(ImGuiCol.TabSelectedOverline,    new ImVec4(0.76, 0.00, 1.00, 1.00));
+		style.setColor(ImGuiCol.TabDimmed,              new ImVec4(0.36, 0.18, 0.41, 1.00));
+		style.setColor(ImGuiCol.TabDimmedSelected,      new ImVec4(0.46, 0.21, 0.54, 1.00));
+		style.setColor(ImGuiCol.DockingPreview,         new ImVec4(0.56, 0.11, 0.71, 1.00));
+
+		ImGuiHandler.instance.addCallback(function() {
+			var ui = ConsoleUI.instance;
+			if (ui == null || !ui.uiVisible) return;
+			ImGui.dockSpaceOverViewport(0, null, ImGuiDockNodeFlags.PassthruCentralNode);
+		});
+		#end
+	}
+}
