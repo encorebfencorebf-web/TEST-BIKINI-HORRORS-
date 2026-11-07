@@ -1,4 +1,5 @@
-name: Mobile Builds
+
+name: Android Build
 
 on:
   push:
@@ -18,7 +19,7 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: mobile-${{ github.ref }}
+  group: android-${{ github.ref }}
   cancel-in-progress: true
 
 env:
@@ -31,34 +32,37 @@ env:
 jobs:
   android:
     name: Android Build (ARM64)
-    permissions: write-all
+    permissions:
+      contents: read
     runs-on: ubuntu-24.04
+
     steps:
-      - name: Pulling the new commit
+      - name: Checkout
         uses: actions/checkout@v7
         with:
           fetch-depth: 0
           filter: blob:none
 
-      - name: Setting up Java
+      - name: Setup Java
         uses: actions/setup-java@v5
         with:
           distribution: zulu
           java-version: 17
 
-      - name: Finding a preinstalled Android NDK
+      - name: Find Android NDK
         id: find-ndk
+        shell: bash
         run: |
-          for dir in $(ls -d $ANDROID_HOME/ndk/27.* 2>/dev/null | sort -V -r); do
+          for dir in $(ls -d "$ANDROID_HOME"/ndk/27.* 2>/dev/null | sort -V -r); do
             if [ -x "$dir/toolchains/llvm/prebuilt/linux-x86_64/bin/clang++" ]; then
-              echo "Using preinstalled NDK $dir"
-              echo "path=$dir" >> $GITHUB_OUTPUT
+              echo "Using preinstalled NDK: $dir"
+              echo "path=$dir" >> "$GITHUB_OUTPUT"
               exit 0
             fi
           done
-          echo "No preinstalled NDK 27 found, downloading ${{ env.NDK_VERSION }}"
+          echo "No preinstalled NDK found."
 
-      - name: Setting up Android NDK
+      - name: Setup Android NDK
         id: setup-ndk
         if: steps.find-ndk.outputs.path == ''
         uses: nttld/setup-ndk@v1
@@ -67,29 +71,29 @@ jobs:
           add-to-path: false
           local-cache: true
 
-      - name: Setting up Haxe
+      - name: Setup Haxe
         uses: krdlab/setup-haxe@v2
         with:
           haxe-version: ${{ env.HAXE_VERSION }}
 
-      - name: Using every CPU core
-        run: echo "HXCPP_COMPILE_THREADS=$(nproc)" >> $GITHUB_ENV
+      - name: Use all CPU cores
+        run: echo "HXCPP_COMPILE_THREADS=$(nproc)" >> "$GITHUB_ENV"
 
-      - name: Restoring libraries
+      - name: Restore libraries cache
         id: libs-cache
         uses: actions/cache/restore@v6
         with:
           path: .haxelib
           key: libs-android-${{ env.LIBS_CACHE_VERSION }}-${{ hashFiles('building/libs.xml') }}
 
-      - name: Restoring compile cache
+      - name: Restore compile cache
         uses: actions/cache@v6
         with:
           path: .hxcpp_cache
           key: hxcpp-android-${{ github.run_id }}
           restore-keys: hxcpp-android-
 
-      - name: Restoring Gradle cache
+      - name: Restore Gradle cache
         uses: actions/cache@v6
         with:
           path: |
@@ -98,107 +102,144 @@ jobs:
           key: gradle-android-${{ hashFiles('project.xml', 'android/**') }}
           restore-keys: gradle-android-
 
-      - name: Updating haxelib
+      - name: Update haxelib
         run: haxelib --global update haxelib
 
-      - name: Installing libraries
+      - name: Install libraries
         if: steps.libs-cache.outputs.cache-hit != 'true'
         run: |
           haxe -cp commandline -D analyzer-optimize --run Main setup -si
           bash building/patch-lime-mobile.sh
 
-      - name: Configuring Lime for Android
+      - name: Configure Lime for Android
+        shell: bash
         run: |
           NDK="${{ steps.find-ndk.outputs.path }}"
-          if [ -z "$NDK" ]; then NDK="${{ steps.setup-ndk.outputs.ndk-path }}"; fi
-          echo "ANDROID_NDK_ROOT=$NDK" >> $GITHUB_ENV
-          echo "ANDROID_NDK_HOME=$NDK" >> $GITHUB_ENV
-          echo "ANDROID_HOST=linux-x86_64" >> $GITHUB_ENV
-          echo "$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin" >> $GITHUB_PATH
-          ls $NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/clang++
-          haxelib run lime config ANDROID_SDK $ANDROID_HOME -nocffi
-          haxelib run lime config ANDROID_NDK_ROOT $NDK -nocffi
-          haxelib run lime config JAVA_HOME $JAVA_HOME -nocffi
+          if [ -z "$NDK" ]; then
+            NDK="${{ steps.setup-ndk.outputs.ndk-path }}"
+          fi
+
+          if [ -z "$NDK" ] || [ ! -x "$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/clang++" ]; then
+            echo "Android NDK is missing or invalid."
+            exit 1
+          fi
+
+          echo "ANDROID_NDK_ROOT=$NDK" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_HOME=$NDK" >> "$GITHUB_ENV"
+          echo "ANDROID_HOST=linux-x86_64" >> "$GITHUB_ENV"
+          echo "$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin" >> "$GITHUB_PATH"
+
+          haxelib run lime config ANDROID_SDK "$ANDROID_HOME" -nocffi
+          haxelib run lime config ANDROID_NDK_ROOT "$NDK" -nocffi
+          haxelib run lime config JAVA_HOME "$JAVA_HOME" -nocffi
           haxelib run lime config ANDROID_SETUP true -nocffi
 
-      - name: Installing packages for building Lime
+      - name: Install Lime build dependencies
         if: steps.libs-cache.outputs.cache-hit != 'true'
         run: |
           sudo apt-get update
           sudo apt-get install -qq \
-          libegl1-mesa-dev libgl1-mesa-dev libibus-1.0-dev libdbus-1-dev libdecor-0-dev libudev-dev libgbm-dev libdrm-dev \
-          libpng-dev libturbojpeg-dev libvorbis-dev libopenal-dev libsdl2-dev libglu1-mesa-dev libmbedtls-dev libuv1-dev libsqlite3-dev \
-          libx11-dev libxext-dev libxfixes-dev libxi-dev libxinerama-dev libxkbcommon-dev libxcursor-dev libxrandr-dev libxss-dev libxt-dev libxtst-dev libxv-dev libxxf86vm-dev \
-          libpulse-dev libasound2-dev libpipewire-0.3-dev libwayland-dev libwayland-bin wayland-protocols
+            libegl1-mesa-dev libgl1-mesa-dev libibus-1.0-dev libdbus-1-dev libdecor-0-dev libudev-dev libgbm-dev libdrm-dev \
+            libpng-dev libturbojpeg-dev libvorbis-dev libopenal-dev libsdl2-dev libglu1-mesa-dev libmbedtls-dev libuv1-dev libsqlite3-dev \
+            libx11-dev libxext-dev libxfixes-dev libxi-dev libxinerama-dev libxkbcommon-dev libxcursor-dev libxrandr-dev libxss-dev libxt-dev libxtst-dev libxv-dev libxxf86vm-dev \
+            libpulse-dev libasound2-dev libpipewire-0.3-dev libwayland-dev libwayland-bin wayland-protocols
 
-      - name: Rebuilding Lime and Hxcpp
+      - name: Rebuild Lime and Hxcpp
         if: steps.libs-cache.outputs.cache-hit != 'true'
         run: |
           haxelib run lime rebuild hxcpp -nocffi
           LIME_PROJECT="$(haxelib libpath lime)/project"
           PROTOCOLS="$LIME_PROJECT/lib/sdl/wayland-protocols"
           GENERATED="$LIME_PROJECT/lib/sdl/wayland-generated-protocols"
+
           mkdir -p "$GENERATED"
+
           for xml in "$PROTOCOLS"/*.xml; do
             name="$(basename "$xml" .xml)-client-protocol"
             wayland-scanner client-header "$xml" "$GENERATED/$name.h"
             wayland-scanner private-code "$xml" "$GENERATED/$name.c"
           done
+
           haxelib run lime rebuild linux -64 -release -nocolor -nocffi
           haxelib run lime rebuild tools
           haxelib run lime rebuild android -release -nocolor -arm64
 
-      - name: Saving libraries
+      - name: Save libraries cache
         if: steps.libs-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@v6
         with:
           path: .haxelib
           key: ${{ steps.libs-cache.outputs.cache-primary-key }}
 
-      - name: Removing stale precompiled headers
+      - name: Remove stale precompiled headers
         run: |
           if [ -d .hxcpp_cache ]; then
             find .hxcpp_cache -type d -name "pch*" -prune -exec rm -rf {} +
           fi
 
-      - name: Configuring Gradle for faster builds
+      - name: Configure Gradle
         run: |
           mkdir -p ~/.gradle/init.d
+
           cat > ~/.gradle/init.d/fast-build.gradle <<'EOF'
           allprojects {
               tasks.configureEach { task ->
-                  if (task.name.startsWith('lintVital') || task.name.startsWith('lintAnalyze') || task.name.startsWith('generateReleaseLintVital'))
+                  if (task.name.startsWith('lintVital') ||
+                      task.name.startsWith('lintAnalyze') ||
+                      task.name.startsWith('generateReleaseLintVital')) {
                       task.enabled = false
+                  }
               }
+
               afterEvaluate { project ->
                   def android = project.extensions.findByName('android')
                   if (android != null) {
-                      try { android.lint.checkReleaseBuilds = false } catch (ignored) {}
-                      try { android.androidResources.noCompress.addAll(['.png', '.ogg', '.mp3', '.wav', '.ttf', '.otf', '.xml', '.json', '.txt', '.hx', '.hscript', '.frag', '.vert', '.lua', '.ini', '.csv', '.mp4', '.webm', '.zip', '.version']) } catch (ignored) {}
+                      try {
+                          android.lint.checkReleaseBuilds = false
+                      } catch (ignored) {}
+
+                      try {
+                          android.androidResources.noCompress.addAll([
+                              '.png', '.ogg', '.mp3', '.wav', '.ttf',
+                              '.otf', '.xml', '.json', '.txt', '.hx',
+                              '.hscript', '.frag', '.vert', '.lua',
+                              '.ini', '.csv', '.mp4', '.webm',
+                              '.zip', '.version'
+                          ])
+                      } catch (ignored) {}
                   }
               }
           }
           EOF
 
-      - name: Building the game
-        run: haxelib run lime build android -release -arm64 -DCOMPILE_EXPERIMENTAL
+      - name: Build Android
+        run: |
+          haxelib run lime build android -release -arm64 -DCOMPILE_EXPERIMENTAL
 
-      - name: Signing the APK
+      - name: Sign APK
         env:
           KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
           KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
           KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
           KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        shell: bash
         run: |
-          BUILD_TOOLS=$(ls -d $ANDROID_HOME/build-tools/* | sort -V | tail -n 1)
-          UNSIGNED=$(find export/release/android/bin -name "*.apk" | head -n 1)
+          set -euo pipefail
+
+          BUILD_TOOLS=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -n 1)
+          UNSIGNED=$(find export/release/android/bin -name "*.apk" -print -quit)
+
           if [ -z "$UNSIGNED" ]; then
             echo "No APK was generated."
             exit 1
           fi
 
-          if [ -n "$KEYSTORE_BASE64" ]; then
+          if [ -n "${KEYSTORE_BASE64:-}" ]; then
             echo "$KEYSTORE_BASE64" | base64 --decode > keystore.jks
+
+            : "${KEYSTORE_PASSWORD:?Missing keystore password}"
+            : "${KEY_ALIAS:?Missing key alias}"
+            : "${KEY_PASSWORD:?Missing key password}"
           else
             KEYSTORE_PASSWORD=codename
             KEY_ALIAS=codename
@@ -207,102 +248,25 @@ jobs:
           fi
 
           mkdir -p build
-          $BUILD_TOOLS/zipalign -f -p 4 "$UNSIGNED" build/aligned.apk
-          $BUILD_TOOLS/apksigner sign --ks keystore.jks --ks-pass pass:$KEYSTORE_PASSWORD --ks-key-alias $KEY_ALIAS \
-            --key-pass pass:$KEY_PASSWORD --out build/CodenameEngine-arm64.apk build/aligned.apk
-          $BUILD_TOOLS/apksigner verify build/CodenameEngine-arm64.apk
+
+          "$BUILD_TOOLS/zipalign" -f -p 4 "$UNSIGNED" build/aligned.apk
+
+          "$BUILD_TOOLS/apksigner" sign \
+            --ks keystore.jks \
+            --ks-pass "pass:$KEYSTORE_PASSWORD" \
+            --ks-key-alias "$KEY_ALIAS" \
+            --key-pass "pass:$KEY_PASSWORD" \
+            --out build/CodenameEngine-arm64.apk \
+            build/aligned.apk
+
+          "$BUILD_TOOLS/apksigner" verify build/CodenameEngine-arm64.apk
+
           rm -f keystore.jks build/aligned.apk
 
-      - name: Uploading artifact
+      - name: Upload APK Artifact
         uses: actions/upload-artifact@v7
         with:
-          name: Codename Engine Android (ARM64)
+          name: Codename-Engine-Android-ARM64
           path: build/CodenameEngine-arm64.apk
-          if-no-files-found: error
-          compression-level: 0
-
-  ios:
-    name: iOS Build
-    permissions: write-all
-    runs-on: macos-26
-    steps:
-      - name: Pulling the new commit
-        uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
-          filter: blob:none
-
-      - name: Setting up Haxe
-        uses: krdlab/setup-haxe@v2
-        with:
-          haxe-version: ${{ env.HAXE_VERSION }}
-
-      - name: Using every CPU core
-        run: echo "HXCPP_COMPILE_THREADS=$(sysctl -n hw.ncpu)" >> $GITHUB_ENV
-
-      - name: Restoring libraries
-        id: libs-cache
-        uses: actions/cache/restore@v6
-        with:
-          path: .haxelib
-          key: libs-ios-${{ env.LIBS_CACHE_VERSION }}-${{ hashFiles('building/libs.xml') }}
-
-      - name: Restoring compile cache
-        uses: actions/cache@v6
-        with:
-          path: .hxcpp_cache
-          key: hxcpp-ios-${{ github.run_id }}
-          restore-keys: hxcpp-ios-
-
-      - name: Updating haxelib
-        run: haxelib --global update haxelib
-
-      - name: Installing libraries
-        if: steps.libs-cache.outputs.cache-hit != 'true'
-        run: |
-          haxe -cp commandline -D analyzer-optimize --run Main setup -si
-          bash building/patch-lime-mobile.sh
-
-      - name: Rebuilding Lime and Hxcpp
-        if: steps.libs-cache.outputs.cache-hit != 'true'
-        run: |
-          haxelib run lime rebuild hxcpp -nocffi
-          haxelib run lime rebuild mac -release -nocolor -nocffi
-          haxelib run lime rebuild tools
-          haxelib run lime rebuild ios -release -nocolor
-
-      - name: Saving libraries
-        if: steps.libs-cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v6
-        with:
-          path: .haxelib
-          key: ${{ steps.libs-cache.outputs.cache-primary-key }}
-
-      - name: Removing stale precompiled headers
-        run: |
-          if [ -d .hxcpp_cache ]; then
-            find .hxcpp_cache -type d -name "pch*" -prune -exec rm -rf {} +
-          fi
-
-      - name: Building the game
-        run: haxelib run lime build ios -release -nosign -DCOMPILE_EXPERIMENTAL
-
-      - name: Packaging the IPA
-        run: |
-          APP=$(find export/release/ios/build -name "*.app" -type d | grep -i "iphoneos" | head -n 1)
-          if [ -z "$APP" ]; then
-            echo "No .app bundle was generated."
-            exit 1
-          fi
-          mkdir -p build/Payload
-          cp -R "$APP" build/Payload/
-          cd build
-          zip -qr CodenameEngine.ipa Payload
-
-      - name: Uploading artifact
-        uses: actions/upload-artifact@v7
-        with:
-          name: Codename Engine iOS
-          path: build/CodenameEngine.ipa
           if-no-files-found: error
           compression-level: 0
